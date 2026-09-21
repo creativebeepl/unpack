@@ -5,6 +5,8 @@ declare(strict_types=1);
  * Rozpakowywarka online — rozpakowuje archiwa przesłane formularzem.
  *
  * Formaty:  ZIP (także z hasłem), TAR, TAR.GZ/TGZ, TAR.BZ2, GZ, BZ2, 7Z
+ *           — rozpakowywanie oraz pakowanie (zakładka „Spakuj”; hasło: ZIP i 7Z,
+ *           podział na części: 7Z)
  * Wymaga:   PHP 8.1+
  *           ext-zip   (ZIP)
  *           ext-zlib  (GZ, TAR.GZ)      — zwykle wbudowane
@@ -310,7 +312,11 @@ function tarHeaderValid(string $h): bool
     if (strlen($h) !== 512 || $h === str_repeat("\0", 512)) {
         return false;
     }
-    $stored = octdec(trim(substr($h, 148, 8), " \0"));
+    $field = trim(substr($h, 148, 8), " \0");
+    if (preg_match('/^[0-7]+$/', $field) !== 1) {
+        return false;
+    }
+    $stored = octdec($field);
     $head = substr($h, 0, 148);
     $tail = substr($h, 156);
     $unsigned = array_sum(unpack('C*', $head)) + 256 + array_sum(unpack('C*', $tail));
@@ -427,7 +433,9 @@ function extractZip(string $path, string $password, Extractor $ex): void
                 fclose($stream);
             }
             if ($written !== null) {
-                $crcOk = hexdec(hash_final($crc)) === (int)$st['crc'];
+                // AES w wariancie AE-2 (małe pliki) nie zapisuje CRC (=0) — integralność zapewnia wtedy HMAC
+                $aes = in_array((int)($st['encryption_method'] ?? 0), [ZipArchive::EM_AES_128, ZipArchive::EM_AES_192, ZipArchive::EM_AES_256], true);
+                $crcOk = ($aes && (int)$st['crc'] === 0) || hexdec(hash_final($crc)) === (int)$st['crc'];
                 if ($written !== (int)$st['size'] || !$crcOk) {
                     throw new RuntimeException($encrypted
                         ? 'Nieprawidłowe hasło albo uszkodzone archiwum.'
@@ -648,14 +656,14 @@ function find7z(): ?string
 }
 
 /** @return array{0:int,1:string,2:string} kod wyjścia, stdout, stderr */
-function runCmd(array $cmd, int $timeout, int $capBytes): array
+function runCmd(array $cmd, int $timeout, int $capBytes, ?string $cwd = null): array
 {
     $env = [
         'PATH' => (string)(getenv('PATH') ?: '/usr/bin:/bin'),
         'LANG' => 'C.UTF-8',
         'LC_ALL' => 'C.UTF-8',
     ];
-    $proc = @proc_open($cmd, [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $env);
+    $proc = @proc_open($cmd, [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, $cwd, $env);
     if (!is_resource($proc)) {
         return [-1, '', 'proc_open failed'];
     }
@@ -768,6 +776,399 @@ function extract7z(string $archive, string $password, Extractor $ex): void
 }
 
 /* ------------------------------------------------------------------ */
+/*  Pakowanie: formaty i ustawienia                                    */
+/* ------------------------------------------------------------------ */
+
+const MIN_PART_BYTES = 65536;
+const MAX_PARTS = 500;
+
+/** Formaty (małymi literami) i informacja, czy ten serwer je obsługuje. @return array<string,bool> */
+function formatAvailability(): array
+{
+    $gz = in_array('compress.zlib', stream_get_wrappers(), true);
+    $bz = in_array('compress.bzip2', stream_get_wrappers(), true);
+    return [
+        'zip' => class_exists('ZipArchive'),
+        'tar' => true,
+        'tar.gz' => $gz,
+        'gz' => $gz,
+        'tar.bz2' => $bz,
+        'bz2' => $bz,
+        '7z' => find7z() !== null && function_exists('proc_open'),
+    ];
+}
+
+function formatLabel(string $slug): string
+{
+    return strtoupper($slug);
+}
+
+/** Zakładka: „pack” tylko dla zapytań o pakowanie, w pozostałych przypadkach „unpack”. */
+function currentTab(): string
+{
+    return ($_POST['action'] ?? '') === 'pack' || ($_GET['tab'] ?? '') === 'pack' ? 'pack' : 'unpack';
+}
+
+/** Ile plików naraz przyjmie PHP (max_file_uploads) i aplikacja (MAX_FILES). */
+function maxUploadFiles(): int
+{
+    $php = (int)ini_get('max_file_uploads');
+    return $php > 0 ? min(MAX_FILES, $php) : MAX_FILES;
+}
+
+/** Zamienia rozmiar części z formularza na bajty; 0 oznacza „bez podziału”. */
+function parsePartSize(string $size, string $unit): int
+{
+    $size = trim(str_replace(',', '.', $size));
+    if ($size === '') {
+        return 0;
+    }
+    if (!is_numeric($size) || (float)$size <= 0) {
+        throw new RuntimeException('Rozmiar części musi być liczbą większą od zera.');
+    }
+    $mult = match (strtoupper($unit)) {
+        'KB' => 1024,
+        'MB' => 1024 ** 2,
+        'GB' => 1024 ** 3,
+        default => throw new RuntimeException('Nieznana jednostka rozmiaru części.'),
+    };
+    $bytes = (int)min(round((float)$size * $mult), 1024 ** 4);
+    if ($bytes < MIN_PART_BYTES) {
+        throw new RuntimeException('Minimalny rozmiar części to ' . humanSize(MIN_PART_BYTES) . '.');
+    }
+    return $bytes;
+}
+
+/** Ucina napis do $max bajtów, nie rozcinając znaku UTF-8. */
+function truncateUtf8(string $s, int $max): string
+{
+    if (strlen($s) <= $max) {
+        return $s;
+    }
+    $s = substr($s, 0, $max);
+    while ($s !== '' && preg_match('//u', $s) !== 1) {
+        $s = substr($s, 0, -1);
+    }
+    return $s;
+}
+
+/**
+ * Nadaje plikowi unikalną ścieżkę w archiwum: przy kolizji (także bez rozróżniania wielkości liter
+ * i między plikiem a folderem) dopisuje „ (2)”, „ (3)”… przed rozszerzeniem.
+ *
+ * @param array{files?:array<string,true>,dirs?:array<string,true>} $taken
+ */
+function uniqueRel(string $rel, array &$taken): string
+{
+    $key = static fn(string $p): string => function_exists('mb_strtolower') ? mb_strtolower($p) : strtolower($p);
+    $taken += ['files' => [], 'dirs' => []];
+    $segs = explode('/', $rel);
+    $last = count($segs) - 1;
+
+    // folder o nazwie zajętej przez zwykły plik: „x/y.txt” po pliku „x” trafia do „x (2)/y.txt”
+    for ($i = 0; $i < $last; $i++) {
+        $orig = $segs[$i];
+        for ($n = 2; isset($taken['files'][$key(implode('/', array_slice($segs, 0, $i + 1)))]); $n++) {
+            $segs[$i] = $orig . ' (' . $n . ')';
+        }
+    }
+
+    // sam plik: zajęta nazwa pliku albo folderu → numer przed rozszerzeniem
+    $dir = $last > 0 ? implode('/', array_slice($segs, 0, $last)) . '/' : '';
+    $base = $segs[$last];
+    $dot = strrpos($base, '.');
+    [$stem, $ext] = ($dot === false || $dot === 0) ? [$base, ''] : [substr($base, 0, $dot), substr($base, $dot)];
+    $cand = $dir . $base;
+    for ($n = 2; isset($taken['files'][$key($cand)]) || isset($taken['dirs'][$key($cand)]); $n++) {
+        $cand = $dir . $stem . ' (' . $n . ')' . $ext;
+    }
+
+    $taken['files'][$key($cand)] = true;
+    for ($p = dirname($key($cand)); $p !== '.' && $p !== '/' && $p !== ''; $p = dirname($p)) {
+        $taken['dirs'][$p] = true;
+    }
+    return $cand;
+}
+
+/** Przekształca $_FILES['files'] (pola files[]) na listę wpisów. @return list<array{name:string,tmp_name:string,error:int}> */
+function normalizeUploads(mixed $f): array
+{
+    if (!is_array($f) || !is_array($f['name'] ?? null) || !is_array($f['tmp_name'] ?? null) || !is_array($f['error'] ?? null)) {
+        return [];
+    }
+    $out = [];
+    foreach (array_keys($f['name']) as $i) {
+        if (is_array($f['name'][$i]) || is_array($f['tmp_name'][$i] ?? null) || is_array($f['error'][$i] ?? null)) {
+            continue; // zagnieżdżone pola files[a][b] — nieobsługiwane
+        }
+        $out[] = ['name' => (string)$f['name'][$i], 'tmp_name' => (string)($f['tmp_name'][$i] ?? ''), 'error' => (int)($f['error'][$i] ?? UPLOAD_ERR_NO_FILE)];
+    }
+    return $out;
+}
+
+/* ------------------------------------------------------------------ */
+/*  TAR — zapis (czysty PHP, także przez gzip/bzip2)                   */
+/* ------------------------------------------------------------------ */
+
+final class TarWriter
+{
+    /** @param resource $fh */
+    public function __construct(private $fh)
+    {
+    }
+
+    private function write(string $data): void
+    {
+        if ($data !== '' && fwrite($this->fh, $data) !== strlen($data)) {
+            throw new RuntimeException('Nie udało się zapisać archiwum (brak miejsca na dysku?).');
+        }
+    }
+
+    private static function octal(int $v, int $width): string
+    {
+        return sprintf('%0' . ($width - 1) . 'o', $v) . "\0";
+    }
+
+    /** Rekord PAX: „<długość> klucz=wartość\n”, gdzie długość obejmuje także własne cyfry. */
+    public static function paxRecord(string $key, string $value): string
+    {
+        $len = strlen($key) + strlen($value) + 3;
+        $n = $len;
+        do {
+            $prev = $n;
+            $n = $len + strlen((string)$prev);
+        } while ($n !== $prev);
+        return $n . ' ' . $key . '=' . $value . "\n";
+    }
+
+    private function header(string $name, int $size, int $mtime, string $type): string
+    {
+        $sizeField = $size < 8 ** 11 ? self::octal($size, 12) : "\x80\0\0\0" . pack('J', $size); // ponad 8 GB: format binarny GNU
+        $h = pack(
+            'a100a8a8a8a12a12a8a1a100a6a2a32a32a8a8a155a12',
+            substr($name, 0, 100),
+            self::octal($type === '5' ? 0755 : 0644, 8),
+            self::octal(0, 8),
+            self::octal(0, 8),
+            $sizeField,
+            self::octal(max(0, $mtime), 12),
+            '        ',
+            $type,
+            '',
+            "ustar\0",
+            '00',
+            '',
+            '',
+            '',
+            '',
+            '',
+            ''
+        );
+        $sum = array_sum(unpack('C*', $h));
+        return substr($h, 0, 148) . sprintf('%06o', $sum) . "\0 " . substr($h, 156);
+    }
+
+    public function addFile(string $name, string $abs, ?int $mtime = null): void
+    {
+        $in = @fopen($abs, 'rb');
+        if ($in === false) {
+            throw new RuntimeException('Nie można odczytać jednego z plików.');
+        }
+        try {
+            $size = (int)filesize($abs);
+            $mtime ??= (int)filemtime($abs);
+            if (strlen($name) > 100) { // długa (lub wielobajtowa) nazwa: rozszerzenie PAX, które czyta też extractTar()
+                $pax = self::paxRecord('path', $name);
+                $this->write($this->header('PaxHeader/' . truncateUtf8(basename($name), 80), strlen($pax), $mtime, 'x'));
+                $this->write($pax . str_repeat("\0", tarPad(strlen($pax))));
+            }
+            $this->write($this->header($name, $size, $mtime, '0'));
+            $left = $size;
+            while ($left > 0) {
+                $chunk = fread($in, min(65536, $left));
+                if ($chunk === false || $chunk === '') {
+                    throw new RuntimeException('Plik zmienił się w trakcie pakowania.');
+                }
+                $this->write($chunk);
+                $left -= strlen($chunk);
+            }
+            $this->write(str_repeat("\0", tarPad($size)));
+        } finally {
+            fclose($in);
+        }
+    }
+
+    public function finish(): void
+    {
+        $this->write(str_repeat("\0", 1024));
+    }
+}
+
+/** Otwiera plik do zapisu, opcjonalnie od razu kompresując: '' (bez), 'gz' albo 'bz2'. @return resource */
+function openCompressedWrite(string $path, string $compression)
+{
+    $fh = match ($compression) {
+        '' => @fopen($path, 'wb'),
+        'gz' => function_exists('gzopen') ? @gzopen($path, 'wb6') : false,
+        'bz2' => function_exists('bzopen') ? @bzopen($path, 'w') : false,
+        default => false,
+    };
+    if ($fh === false) {
+        throw new RuntimeException('Nie można utworzyć archiwum (brak obsługi kompresji na tym serwerze?).');
+    }
+    return $fh;
+}
+
+/** @param array<string,string> $entries ścieżka w archiwum => ścieżka na dysku */
+function packTar(array $entries, string $out, string $compression): void
+{
+    $fh = openCompressedWrite($out, $compression);
+    try {
+        $tar = new TarWriter($fh);
+        foreach ($entries as $rel => $abs) {
+            $tar->addFile((string)$rel, $abs);
+        }
+        $tar->finish();
+    } finally {
+        fclose($fh);
+    }
+}
+
+/** Jeden plik do .gz / .bz2. */
+function packSingle(string $abs, string $out, string $compression): void
+{
+    $in = @fopen($abs, 'rb');
+    if ($in === false) {
+        throw new RuntimeException('Nie można odczytać pliku.');
+    }
+    try {
+        $fh = openCompressedWrite($out, $compression);
+        try {
+            while (($chunk = fread($in, 65536)) !== false && $chunk !== '') {
+                if (fwrite($fh, $chunk) !== strlen($chunk)) {
+                    throw new RuntimeException('Nie udało się zapisać archiwum (brak miejsca na dysku?).');
+                }
+            }
+        } finally {
+            fclose($fh);
+        }
+    } finally {
+        fclose($in);
+    }
+}
+
+/** @param array<string,string> $entries ścieżka w archiwum => ścieżka na dysku */
+function packZip(array $entries, string $out, string $password): void
+{
+    if (!class_exists('ZipArchive')) {
+        throw new RuntimeException('Ten serwer nie ma rozszerzenia PHP „zip”, więc nie utworzy plików ZIP.');
+    }
+    $zip = new ZipArchive();
+    if ($zip->open($out, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+        throw new RuntimeException('Nie można utworzyć archiwum ZIP.');
+    }
+    foreach ($entries as $rel => $abs) {
+        $rel = (string)$rel;
+        // nazwy zawsze jako UTF-8 (z flagą UTF-8 w archiwum), dzięki czemu polskie znaki są czytelne
+        if (!$zip->addFile($abs, $rel, 0, 0, ZipArchive::FL_ENC_UTF_8)) {
+            throw new RuntimeException('Nie można dodać pliku do archiwum ZIP.');
+        }
+        if ($password !== '' && !$zip->setEncryptionName($rel, ZipArchive::EM_AES_256, $password)) {
+            throw new RuntimeException('Nie można zaszyfrować archiwum ZIP.');
+        }
+    }
+    if (!$zip->close()) {
+        throw new RuntimeException('Nie udało się zapisać archiwum ZIP.');
+    }
+}
+
+/** 7Z przez program 7z. Pliki muszą leżeć w $inDir pod swoimi ścieżkami z archiwum. */
+function pack7z(string $inDir, string $out, string $password, int $partBytes): void
+{
+    $bin = find7z();
+    if ($bin === null || !function_exists('proc_open')) {
+        throw new RuntimeException('Ten serwer nie obsługuje 7Z (brak programu 7z).');
+    }
+    $cmd = [$bin, 'a', '-t7z', '-y', '-bd', '-mx=5'];
+    if ($password !== '') {
+        $cmd[] = '-p' . $password;
+        $cmd[] = '-mhe=on'; // szyfruj także nazwy plików
+    }
+    if ($partBytes > 0) {
+        $cmd[] = '-v' . $partBytes . 'b';
+    }
+    // katalog roboczy = $inDir, więc w archiwum nie ma ścieżek bezwzględnych
+    [$code, $stdout, $stderr] = runCmd(array_merge($cmd, ['--', $out, '*']), 300, 65536, $inDir);
+    if ($code < 0 || $code > 1) {
+        error_log('7z: ' . substr($stderr . "\n" . $stdout, 0, 500));
+        throw new RuntimeException('Nie udało się utworzyć archiwum 7Z.');
+    }
+}
+
+/**
+ * Pakuje wpisy do jednego archiwum (albo do części, dla 7Z z $partBytes) w $outDir.
+ *
+ * @param array<string,string> $entries ścieżka w archiwum => ścieżka pliku na dysku
+ * @param string $inDir katalog, w którym leżą pliki (potrzebny tylko dla 7Z)
+ * @return array{type:string,name:string,files:array<string,int>} faktyczny format, nazwa i rozmiary utworzonych plików
+ */
+function packEntries(string $format, array $entries, string $inDir, string $outDir, string $baseName, string $password = '', int $partBytes = 0): array
+{
+    if (!$entries) {
+        throw new RuntimeException('Dodaj przynajmniej jeden plik.');
+    }
+    if ($password !== '' && !in_array($format, ['zip', '7z'], true)) {
+        throw new RuntimeException('Hasło można ustawić tylko dla archiwów ZIP i 7Z.');
+    }
+    if ($partBytes > 0 && $format !== '7z') {
+        throw new RuntimeException('Podział na części jest dostępny tylko dla formatu 7Z.');
+    }
+    $type = $format;
+    if (count($entries) > 1 && ($format === 'gz' || $format === 'bz2')) {
+        $type = 'tar.' . $format; // GZ i BZ2 pakują jeden strumień — wiele plików najpierw do TAR
+    }
+    $name = truncateUtf8($baseName, 150) . '.' . $type;
+    $out = $outDir . '/' . $name;
+
+    switch ($type) {
+        case 'zip':
+            packZip($entries, $out, $password);
+            break;
+        case 'tar':
+            packTar($entries, $out, '');
+            break;
+        case 'tar.gz':
+            packTar($entries, $out, 'gz');
+            break;
+        case 'tar.bz2':
+            packTar($entries, $out, 'bz2');
+            break;
+        case 'gz':
+        case 'bz2':
+            packSingle((string)reset($entries), $out, $type);
+            break;
+        case '7z':
+            pack7z($inDir, $out, $password, $partBytes);
+            break;
+        default:
+            throw new RuntimeException('Nieznany format archiwum.');
+    }
+
+    $files = [];
+    foreach (new DirectoryIterator($outDir) as $f) {
+        $fn = $f->getFilename();
+        if ($f->isFile() && ($fn === $name || preg_match('/^' . preg_quote($name, '/') . '\.\d{3,}$/', $fn) === 1)) {
+            $files[$fn] = (int)$f->getSize();
+        }
+    }
+    uksort($files, 'strnatcasecmp');
+    if (!$files || max($files) === 0) {
+        throw new RuntimeException('Nie udało się utworzyć archiwum.');
+    }
+    return ['type' => $type, 'name' => $name, 'files' => $files];
+}
+
+/* ------------------------------------------------------------------ */
 /*  Zadania (wyniki rozpakowania) i sesja                              */
 /* ------------------------------------------------------------------ */
 
@@ -824,23 +1225,28 @@ function loadJob(string $token): ?array
     return ['meta' => $meta, 'dir' => $dir, 'files' => $dir . '/files'];
 }
 
+function checkUploadError(int $err, string $noFileMsg): void
+{
+    switch ($err) {
+        case UPLOAD_ERR_OK:
+            return;
+        case UPLOAD_ERR_NO_FILE:
+            fail($noFileMsg);
+        case UPLOAD_ERR_INI_SIZE:
+        case UPLOAD_ERR_FORM_SIZE:
+            fail('Plik jest za duży. Limit przesyłania na tym serwerze to ' . humanSize(uploadLimit()) . '.', 413);
+        default:
+            fail('Przesyłanie pliku nie powiodło się (kod ' . $err . '). Spróbuj ponownie.');
+    }
+}
+
 function handleUpload(): void
 {
     $file = $_FILES['archive'] ?? null;
     if (!is_array($file) || is_array($file['error'] ?? null)) {
         fail('Wybierz plik archiwum.');
     }
-    switch ((int)$file['error']) {
-        case UPLOAD_ERR_OK:
-            break;
-        case UPLOAD_ERR_NO_FILE:
-            fail('Wybierz plik archiwum.');
-        case UPLOAD_ERR_INI_SIZE:
-        case UPLOAD_ERR_FORM_SIZE:
-            fail('Plik jest za duży. Limit przesyłania na tym serwerze to ' . humanSize(uploadLimit()) . '.', 413);
-        default:
-            fail('Przesyłanie pliku nie powiodło się (kod ' . (int)$file['error'] . '). Spróbuj ponownie.');
-    }
+    checkUploadError((int)$file['error'], 'Wybierz plik archiwum.');
     $tmp = (string)$file['tmp_name'];
     if (!is_uploaded_file($tmp)) {
         fail('Nieprawidłowy plik.');
@@ -924,15 +1330,133 @@ function handleUpload(): void
     exit;
 }
 
+function handlePack(): never
+{
+    $avail = formatAvailability();
+    $format = (string)($_POST['format'] ?? '');
+    if (!isset($avail[$format])) {
+        fail('Wybierz format archiwum.');
+    }
+    if (!$avail[$format]) {
+        fail('Ten serwer nie obsługuje formatu ' . formatLabel($format) . '.', 501);
+    }
+    $password = (string)($_POST['password'] ?? '');
+    if ($password !== '' && !in_array($format, ['zip', '7z'], true)) {
+        fail('Hasło można ustawić tylko dla archiwów ZIP i 7Z.');
+    }
+    try {
+        $partBytes = parsePartSize((string)($_POST['part_size'] ?? ''), (string)($_POST['part_unit'] ?? 'MB'));
+    } catch (RuntimeException $e) {
+        fail($e->getMessage());
+    }
+    if ($partBytes > 0 && $format !== '7z') {
+        fail('Podział na części jest dostępny tylko dla formatu 7Z.');
+    }
+
+    $uploads = normalizeUploads($_FILES['files'] ?? null);
+    if (!$uploads) {
+        fail('Dodaj przynajmniej jeden plik.');
+    }
+    $paths = is_array($_POST['paths'] ?? null) ? array_values($_POST['paths']) : [];
+    if ($paths && count($paths) !== count($uploads)) { // PHP po cichu odrzuca nadmiar (max_file_uploads, max_input_vars)
+        fail('Nie wszystkie pliki dotarły na serwer. Dodaj mniej plików naraz (limit: ' . maxUploadFiles() . ').', 413);
+    }
+    if (count($uploads) > maxUploadFiles()) {
+        fail('Za dużo plików naraz. Limit to ' . maxUploadFiles() . '.', 413);
+    }
+
+    $taken = [];
+    $entries = [];
+    $total = 0;
+    foreach ($uploads as $i => $u) {
+        checkUploadError($u['error'], 'Dodaj przynajmniej jeden plik.');
+        if (!is_uploaded_file($u['tmp_name'])) {
+            fail('Nieprawidłowy plik.');
+        }
+        $raw = is_string($paths[$i] ?? null) && $paths[$i] !== '' ? $paths[$i] : basename(str_replace('\\', '/', $u['name']));
+        $rel = safeRelPath(fixEncoding($raw));
+        if ($rel === null) {
+            fail('Nieprawidłowa nazwa pliku: „' . fixEncoding($raw) . '”.', 422);
+        }
+        $total += (int)filesize($u['tmp_name']);
+        if ($total > MAX_UNPACKED_BYTES) {
+            fail('Pliki przekraczają limit ' . humanSize(MAX_UNPACKED_BYTES) . '.', 413);
+        }
+        $entries[uniqueRel($rel, $taken)] = $u['tmp_name'];
+    }
+    if ($partBytes > 0 && intdiv($total, $partBytes) + 1 > MAX_PARTS) {
+        fail('Archiwum miałoby ponad ' . MAX_PARTS . ' części. Zwiększ rozmiar części.', 422);
+    }
+
+    if (!is_dir(WORK_DIR) && !@mkdir(WORK_DIR, 0700, true) && !is_dir(WORK_DIR)) {
+        error_log('Rozpakowywarka: nie można utworzyć ' . WORK_DIR);
+        fail('Serwer nie ma miejsca na pliki tymczasowe.', 500);
+    }
+    @set_time_limit(300);
+
+    $token = bin2hex(random_bytes(16));
+    $jobDir = WORK_DIR . '/' . $token;
+    $inDir = $jobDir . '/in';
+    $outDir = $jobDir . '/files';
+    if (!@mkdir($inDir, 0700, true) || !@mkdir($outDir, 0700, true)) {
+        rrmdir($jobDir);
+        fail('Serwer nie ma miejsca na pliki tymczasowe.', 500);
+    }
+
+    try {
+        $abs = [];
+        foreach ($entries as $rel => $tmp) {
+            $dst = $inDir . '/' . $rel;
+            if ((!is_dir(dirname($dst)) && !@mkdir(dirname($dst), 0700, true)) || !move_uploaded_file($tmp, $dst)) {
+                throw new RuntimeException('Nie udało się zapisać przesłanego pliku.');
+            }
+            $abs[$rel] = $dst;
+        }
+        uksort($abs, 'strnatcasecmp');
+        $baseName = count($abs) === 1 ? basename((string)array_key_first($abs)) : 'archiwum';
+        $result = packEntries($format, $abs, $inDir, $outDir, $baseName, $password, $partBytes);
+    } catch (RuntimeException $e) {
+        rrmdir($jobDir);
+        fail($e->getMessage(), 422);
+    } catch (Throwable $e) {
+        rrmdir($jobDir);
+        error_log('Rozpakowywarka: ' . $e);
+        fail('Nie udało się spakować plików.', 500);
+    }
+    rrmdir($inDir); // zostaje tylko gotowe archiwum
+
+    file_put_contents($jobDir . '/meta.json', json_encode([
+        'mode' => 'pack',
+        'name' => $result['name'],
+        'type' => $result['type'],
+        'created' => time(),
+        'bytes' => array_sum($result['files']),
+        'files' => $result['files'],
+        'inputCount' => count($abs),
+        'inputBytes' => $total,
+        'encrypted' => $password !== '',
+        'skipped' => [],
+    ], JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE));
+
+    $_SESSION['jobs'] = array_slice(($_SESSION['jobs'] ?? []) + [$token => time()], -30, null, true);
+    $redirect = selfUrl() . '?j=' . $token . '#wynik'; // od razu do wyniku, pod formularzem
+    if (isAjax()) {
+        jsonOut(['ok' => true, 'redirect' => $redirect]);
+    }
+    header('Location: ' . $redirect, true, 303);
+    exit;
+}
+
 function handlePost(): void
 {
     if (empty($_POST) && empty($_FILES) && (int)($_SERVER['CONTENT_LENGTH'] ?? 0) > 0) {
-        fail('Plik jest za duży. Limit przesyłania na tym serwerze to ' . humanSize(uploadLimit()) . '.', 413);
+        fail('Przesyłane pliki są za duże. Limit przesyłania na tym serwerze to ' . humanSize(uploadLimit()) . '.', 413);
     }
     if (!hash_equals((string)$_SESSION['csrf'], (string)($_POST['csrf'] ?? ''))) {
         fail('Sesja wygasła. Odśwież stronę i spróbuj ponownie.', 403);
     }
-    if (($_POST['action'] ?? 'upload') === 'delete') {
+    $action = (string)($_POST['action'] ?? 'upload');
+    if ($action === 'delete') {
         $token = (string)($_POST['token'] ?? '');
         $job = loadJob($token);
         if ($job !== null) {
@@ -941,6 +1465,9 @@ function handlePost(): void
         unset($_SESSION['jobs'][$token]);
         header('Location: ' . selfUrl(), true, 303);
         exit;
+    }
+    if ($action === 'pack') {
+        handlePack();
     }
     handleUpload();
 }
@@ -975,11 +1502,15 @@ function handleDownload(): void
             echo 'Nie można utworzyć archiwum.';
             return;
         }
+        $isPack = ($job['meta']['mode'] ?? 'unpack') === 'pack';
         foreach (array_keys($job['meta']['files']) as $rel) {
             $rel = (string)$rel;
             $abs = $job['files'] . '/' . $rel;
             if (is_file($abs) && !is_link($abs)) {
                 $zip->addFile($abs, $rel);
+                if ($isPack) { // części są już spakowane — bez ponownej kompresji
+                    $zip->setCompressionName($rel, ZipArchive::CM_STORE);
+                }
             }
         }
         if (!$zip->close() || !is_file($tmp)) {
@@ -988,7 +1519,7 @@ function handleDownload(): void
             return;
         }
         $base = preg_replace('/\.[A-Za-z0-9]+$/', '', (string)$job['meta']['name']);
-        $dl = ($base !== '' && $base !== null ? $base : 'pliki') . '-rozpakowane.zip';
+        $dl = ($base !== '' && $base !== null ? $base : 'pliki') . ($isPack ? '-czesci.zip' : '-rozpakowane.zip');
         sendFile($tmp, $dl, 'application/zip');
         @unlink($tmp);
         return;
@@ -1036,28 +1567,26 @@ function renderPage(?string $error = null, ?array $job = null, string $token = '
     $self = selfUrl();
     $csrf = (string)$_SESSION['csrf'];
     $limit = uploadLimit();
-    $gz = in_array('compress.zlib', stream_get_wrappers(), true);
-    $bz = in_array('compress.bzip2', stream_get_wrappers(), true);
-    $formats = [
-        'ZIP' => class_exists('ZipArchive'),
-        'TAR' => true,
-        'TAR.GZ' => $gz,
-        'GZ' => $gz,
-        'TAR.BZ2' => $bz,
-        'BZ2' => $bz,
-        '7Z' => find7z() !== null && function_exists('proc_open'),
-    ];
+    $formats = [];
+    foreach (formatAvailability() as $slug => $ok) {
+        $formats[formatLabel($slug)] = $ok;
+    }
     $supported = array_keys(array_filter($formats));
     $missing = array_keys(array_filter($formats, static fn(bool $v): bool => !$v));
     $meta = $job['meta'] ?? null;
     $files = $meta['files'] ?? [];
+    $tab = $meta !== null ? (string)($meta['mode'] ?? 'unpack') : currentTab();
+    $isPack = $tab === 'pack';
+    $maxFileBytes = iniBytes(ini_get('upload_max_filesize'));
+    $maxTotalBytes = iniBytes(ini_get('post_max_size'));
+    $maxFiles = maxUploadFiles();
     ?>
 <!doctype html>
 <html lang="pl">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Rozpakowywarka online</title>
+<title><?= $isPack ? 'Spakuj pliki online' : 'Rozpakowywarka online' ?></title>
 <style nonce="<?= h($nonce) ?>">
 :root{
   --fog:#E8EDF2; --paper:#FBFCFD; --ink:#14213D; --slate:#4F5E75; --line:#C4CEDB;
@@ -1083,8 +1612,23 @@ h2{font:700 1.35rem/1.2 "Iowan Old Style","Palatino Linotype",Palatino,Georgia,s
 #picked{display:block;margin-top:.6rem;font-weight:600;color:var(--ink);overflow-wrap:anywhere}
 label.field{display:block;margin:1.4rem 0 0;font-weight:600}
 label.field small{display:block;font-weight:400;color:var(--slate)}
-input[type=password],input[type=search]{font:inherit;width:100%;max-width:22rem;margin-top:.4rem;padding:.6rem .75rem;color:var(--ink);background:var(--paper);border:2px solid var(--line);border-radius:4px}
-input[type=password]:focus,input[type=search]:focus{outline:3px solid var(--focus);outline-offset:1px;border-color:var(--ink)}
+input[type=password],input[type=search],input[type=number],select{font:inherit;width:100%;max-width:22rem;margin-top:.4rem;padding:.6rem .75rem;color:var(--ink);background:var(--paper);border:2px solid var(--line);border-radius:4px}
+input[type=password]:focus,input[type=search]:focus,input[type=number]:focus,select:focus{outline:3px solid var(--focus);outline-offset:1px;border-color:var(--ink)}
+input:disabled,select:disabled{opacity:.5;cursor:not-allowed}
+.tabs{display:flex;gap:.5rem;margin:0 0 1.6rem;padding:0;list-style:none}
+.tabs a{display:block;padding:.5rem 1.1rem;border:2px solid var(--line);border-radius:4px;text-decoration:none;font-weight:700;color:var(--slate)}
+.tabs a[aria-current=page]{background:var(--tape);border-color:var(--on-tape);color:var(--on-tape)}
+.pair{display:flex;flex-wrap:wrap;gap:.75rem}
+.pair>*{flex:1 1 8rem}
+.pair input[type=number]{max-width:none}
+.pair select{max-width:none}
+.btn.small{padding:.25rem .8rem;font-size:.875rem}
+#folder[hidden]{display:none}
+#picklist{margin-top:1.4rem}
+#picklist[hidden]{display:none}
+#picksum{margin:.6rem 0 0;color:var(--slate)}
+#fmtnote{margin:.4rem 0 0;color:var(--slate);font-size:.925rem}
+td.rm{white-space:nowrap;text-align:right;padding-left:1rem}
 .btn{font:inherit;font-weight:700;display:inline-block;text-decoration:none;cursor:pointer;padding:.7rem 1.4rem;border-radius:4px;border:2px solid var(--on-tape);background:var(--tape);color:var(--on-tape)}
 .btn:hover{filter:brightness(1.06)}
 .btn:focus-visible{outline:3px solid var(--focus);outline-offset:3px}
@@ -1121,11 +1665,79 @@ details ul{margin:.5rem 0 0;padding-left:1.2rem;overflow-wrap:anywhere}
 </head>
 <body>
 <main>
+  <nav aria-label="Tryb">
+    <ul class="tabs">
+      <li><a href="<?= h($self) ?>"<?= !$isPack ? ' aria-current="page"' : '' ?>>Rozpakuj</a></li>
+      <li><a href="<?= h($self) ?>?tab=pack"<?= $isPack ? ' aria-current="page"' : '' ?>>Spakuj</a></li>
+    </ul>
+  </nav>
+
+<?php if ($isPack): ?>
+  <h1>Spakuj pliki online</h1>
+  <p class="lead">Dodaj jeden lub wiele plików, wybierz format i — jeśli chcesz — ustaw hasło. Gotowe archiwum pobierzesz w wybranym formacie.</p>
+<?php else: ?>
   <h1>Rozpakuj archiwum online</h1>
   <p class="lead">Wybierz plik ZIP, TAR, 7Z lub inne archiwum. Pliki pobierzesz pojedynczo albo razem jako jeden ZIP.</p>
+<?php endif; ?>
 
   <p id="error" class="error" role="alert"<?= $error === null ? ' hidden' : '' ?>><?= $error !== null ? h($error) : '' ?></p>
 
+<?php if ($isPack): ?>
+  <form id="pack" method="post" enctype="multipart/form-data" action="<?= h($self) ?>" data-max-file="<?= (int)$maxFileBytes ?>" data-max-total="<?= (int)$maxTotalBytes ?>" data-max-files="<?= (int)$maxFiles ?>" data-max-input="<?= (int)MAX_UNPACKED_BYTES ?>">
+    <input type="hidden" name="csrf" value="<?= h($csrf) ?>">
+    <input type="hidden" name="action" value="pack">
+
+    <label class="drop" id="drop">
+      <input type="file" name="files[]" id="picker" multiple>
+      <strong>Upuść pliki lub foldery tutaj albo wybierz je z dysku</strong>
+      <span>Możesz dodać wiele plików naraz. Limit jednego pliku: <?= $maxFileBytes > 0 ? h(humanSize($maxFileBytes)) : 'brak' ?>, wszystkich razem: <?= $maxTotalBytes > 0 ? h(humanSize($maxTotalBytes)) : 'brak' ?>.</span>
+    </label>
+    <div class="row">
+      <button class="btn quiet small" type="button" id="folder" hidden>Dodaj cały folder</button>
+      <button class="btn quiet small" type="button" id="clear" hidden>Wyczyść listę</button>
+    </div>
+
+    <table id="picklist" hidden>
+      <caption class="visually-hidden">Wybrane pliki</caption>
+      <tbody></tbody>
+    </table>
+    <p id="picksum" aria-live="polite"></p>
+
+    <label class="field" for="format">Format archiwum</label>
+    <select id="format" name="format">
+<?php foreach (formatAvailability() as $slug => $ok): ?>
+      <option value="<?= h($slug) ?>"<?= $ok ? '' : ' disabled' ?><?= $slug === 'zip' ? ' selected' : '' ?>><?= h(formatLabel($slug)) ?><?= $ok ? '' : ' (niedostępny na tym serwerze)' ?></option>
+<?php endforeach; ?>
+    </select>
+    <p id="fmtnote"></p>
+
+    <label class="field" for="password">Hasło do archiwum <small>Opcjonalne — tylko dla ZIP (AES-256) i 7Z (szyfruje też nazwy plików).</small></label>
+    <input type="password" id="password" name="password" autocomplete="new-password">
+
+    <label class="field" for="part_size">Podział na części <small>Opcjonalne — tylko dla 7Z. Zostaw puste, by nie dzielić archiwum.</small></label>
+    <div class="pair">
+      <input type="number" id="part_size" name="part_size" min="1" step="any" inputmode="decimal" placeholder="np. 100">
+      <select id="part_unit" name="part_unit" aria-label="Jednostka rozmiaru części">
+        <option value="KB">KB</option>
+        <option value="MB" selected>MB</option>
+        <option value="GB">GB</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <button class="btn" type="submit" id="go">Spakuj</button>
+    </div>
+    <div class="bar" id="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden><i></i></div>
+    <p id="status" aria-live="polite"></p>
+  </form>
+
+  <p class="note">
+    Dostępne formaty: <?= h(joinPl($supported)) ?>.<?= $missing ? ' Niedostępne na tym serwerze: ' . h(joinPl($missing)) . '.' : '' ?>
+    GZ i BZ2 pakują jeden plik — przy wielu plikach powstanie TAR.GZ lub TAR.BZ2.
+    Wynik jest przechowywany <?= (int)max(1, round(TTL_SECONDS / 60)) ?> min i widzisz go tylko w tej przeglądarce.
+    Limity: <?= h(humanSize(MAX_UNPACKED_BYTES)) ?> i <?= (int)$maxFiles ?> plików.
+  </p>
+<?php else: ?>
   <form id="upload" method="post" enctype="multipart/form-data" action="<?= h($self) ?>" data-max="<?= (int)$limit ?>">
     <input type="hidden" name="csrf" value="<?= h($csrf) ?>">
     <input type="hidden" name="action" value="upload">
@@ -1154,14 +1766,23 @@ details ul{margin:.5rem 0 0;padding-left:1.2rem;overflow-wrap:anywhere}
     Rozpakowane pliki są przechowywane <?= (int)max(1, round(TTL_SECONDS / 60)) ?> min i widzisz je tylko w tej przeglądarce.
     Limity po rozpakowaniu: <?= h(humanSize(MAX_UNPACKED_BYTES)) ?> i <?= (int)MAX_FILES ?> plików.
   </p>
+<?php endif; ?>
 
 <?php if ($meta !== null): ?>
-  <section class="result" aria-labelledby="result-title">
+  <section class="result" id="wynik" aria-labelledby="result-title">
+<?php if ($isPack): ?>
+    <h2 id="result-title">Spakowano: <?= h((string)$meta['name']) ?></h2>
+    <p class="summary">
+      <?= (int)$meta['inputCount'] ?> <?= plural((int)$meta['inputCount'], 'plik', 'pliki', 'plików') ?> (<?= h(humanSize((int)$meta['inputBytes'])) ?>)
+      → <?= h(strtoupper((string)$meta['type'])) ?>, <?= h(humanSize((int)$meta['bytes'])) ?><?= count($files) > 1 ? ' w ' . count($files) . ' częściach' : '' ?><?= !empty($meta['encrypted']) ? ', zaszyfrowane hasłem' : '' ?>.
+    </p>
+<?php else: ?>
     <h2 id="result-title">Rozpakowano: <?= h((string)$meta['name']) ?></h2>
     <p class="summary"><?= count($files) ?> <?= plural(count($files), 'plik', 'pliki', 'plików') ?>, razem <?= h(humanSize((int)$meta['bytes'])) ?>.</p>
+<?php endif; ?>
     <div class="row">
-      <?php if (class_exists('ZipArchive')): ?>
-      <a class="btn" href="?d=<?= h($token) ?>&amp;all=1">Pobierz wszystko jako ZIP</a>
+      <?php if (class_exists('ZipArchive') && (!$isPack || count($files) > 1)): ?>
+      <a class="btn" href="?d=<?= h($token) ?>&amp;all=1"><?= $isPack ? 'Pobierz wszystkie części jako ZIP' : 'Pobierz wszystko jako ZIP' ?></a>
       <?php endif; ?>
       <form method="post" action="<?= h($self) ?>">
         <input type="hidden" name="csrf" value="<?= h($csrf) ?>">
@@ -1178,7 +1799,7 @@ details ul{margin:.5rem 0 0;padding-left:1.2rem;overflow-wrap:anywhere}
 
     <div class="table-wrap">
       <table id="files">
-        <caption class="visually-hidden">Rozpakowane pliki</caption>
+        <caption class="visually-hidden"><?= $isPack ? 'Pliki archiwum' : 'Rozpakowane pliki' ?></caption>
         <tbody>
 <?php foreach ($files as $rel => $size):
     $rel = (string)$rel;
@@ -1209,16 +1830,12 @@ details ul{margin:.5rem 0 0;padding-left:1.2rem;overflow-wrap:anywhere}
 
 <script nonce="<?= h($nonce) ?>">
 (function () {
-  var form = document.getElementById('upload');
-  var input = form.querySelector('input[type=file]');
-  var drop = document.getElementById('drop');
-  var picked = document.getElementById('picked');
-  var go = document.getElementById('go');
   var bar = document.getElementById('bar');
   var fill = bar.firstElementChild;
   var status = document.getElementById('status');
   var errBox = document.getElementById('error');
-  var maxBytes = parseInt(form.getAttribute('data-max'), 10) || 0;
+  var go = document.getElementById('go');
+  var drop = document.getElementById('drop');
 
   function fmt(n) {
     var u = ['B', 'KB', 'MB', 'GB'], i = 0;
@@ -1227,36 +1844,19 @@ details ul{margin:.5rem 0 0;padding-left:1.2rem;overflow-wrap:anywhere}
   }
   function showError(msg) { errBox.textContent = msg; errBox.hidden = false; }
   function clearError() { errBox.hidden = true; }
-  function showFile() {
-    var f = input.files[0];
-    picked.textContent = f ? f.name + ' (' + fmt(f.size) + ')' : '';
-    clearError();
-  }
   function reset() {
     go.disabled = false; bar.hidden = true; bar.classList.remove('busy');
     fill.style.width = '0'; status.textContent = '';
   }
+  function plPlural(n, one, few, many) {
+    var l = n % 10, l2 = n % 100;
+    if (n === 1) { return one; }
+    return (l >= 2 && l <= 4 && (l2 < 12 || l2 > 14)) ? few : many;
+  }
 
-  input.addEventListener('change', showFile);
-  ['dragenter', 'dragover'].forEach(function (ev) {
-    drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.add('is-over'); });
-  });
-  ['dragleave', 'drop'].forEach(function (ev) {
-    drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.remove('is-over'); });
-  });
-  drop.addEventListener('drop', function (e) {
-    if (e.dataTransfer && e.dataTransfer.files.length) { input.files = e.dataTransfer.files; showFile(); }
-  });
-
-  form.addEventListener('submit', function (e) {
-    if (!window.FormData || !window.XMLHttpRequest) { return; }   // zwykły formularz jako zapas
-    e.preventDefault();
-    var f = input.files[0];
-    if (!f) { showError('Wybierz plik archiwum.'); return; }
-    if (maxBytes && f.size > maxBytes) {
-      showError('Plik jest za duży. Limit przesyłania na tym serwerze to ' + fmt(maxBytes) + '.');
-      return;
-    }
+  // wysyła formularz przez XHR z paskiem postępu; zwraca false, gdy przeglądarka nie potrafi
+  function send(form, data, busyText, failText) {
+    if (!window.FormData || !window.XMLHttpRequest) { return false; }
     clearError();
     go.disabled = true; bar.hidden = false; status.textContent = 'Wysyłanie: 0%';
 
@@ -1273,18 +1873,220 @@ details ul{margin:.5rem 0 0;padding-left:1.2rem;overflow-wrap:anywhere}
     };
     xhr.upload.onload = function () {
       fill.style.width = '100%'; bar.classList.add('busy');
-      status.textContent = 'Rozpakowywanie…';
+      status.textContent = busyText;
     };
     xhr.onload = function () {
       var r = null;
       try { r = JSON.parse(xhr.responseText); } catch (_) {}
       if (r && r.ok) { window.location.href = r.redirect; return; }
       reset();
-      showError((r && r.error) || 'Nie udało się rozpakować archiwum.');
+      showError((r && r.error) || failText);
     };
     xhr.onerror = function () { reset(); showError('Błąd połączenia z serwerem. Spróbuj ponownie.'); };
-    xhr.send(new FormData(form));
-  });
+    xhr.send(data);
+    return true;
+  }
+
+  function dragUi(onDrop) {
+    ['dragenter', 'dragover'].forEach(function (ev) {
+      drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.add('is-over'); });
+    });
+    ['dragleave', 'drop'].forEach(function (ev) {
+      drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.remove('is-over'); });
+    });
+    drop.addEventListener('drop', onDrop);
+  }
+
+  /* ---------- Rozpakuj ---------- */
+  var upload = document.getElementById('upload');
+  if (upload) {
+    var input = upload.querySelector('input[type=file]');
+    var picked = document.getElementById('picked');
+    var maxBytes = parseInt(upload.getAttribute('data-max'), 10) || 0;
+
+    var showFile = function () {
+      var f = input.files[0];
+      picked.textContent = f ? f.name + ' (' + fmt(f.size) + ')' : '';
+      clearError();
+    };
+    input.addEventListener('change', showFile);
+    dragUi(function (e) {
+      if (e.dataTransfer && e.dataTransfer.files.length) { input.files = e.dataTransfer.files; showFile(); }
+    });
+    upload.addEventListener('submit', function (e) {
+      if (!window.FormData || !window.XMLHttpRequest) { return; }   // zwykły formularz jako zapas
+      e.preventDefault();
+      var f = input.files[0];
+      if (!f) { showError('Wybierz plik archiwum.'); return; }
+      if (maxBytes && f.size > maxBytes) {
+        showError('Plik jest za duży. Limit przesyłania na tym serwerze to ' + fmt(maxBytes) + '.');
+        return;
+      }
+      send(upload, new FormData(upload), 'Rozpakowywanie…', 'Nie udało się rozpakować archiwum.');
+    });
+  }
+
+  /* ---------- Spakuj ---------- */
+  var pack = document.getElementById('pack');
+  if (pack) {
+    var picker = document.getElementById('picker');
+    var list = document.getElementById('picklist');
+    var listBody = list.querySelector('tbody');
+    var sum = document.getElementById('picksum');
+    var format = document.getElementById('format');
+    var note = document.getElementById('fmtnote');
+    var password = document.getElementById('password');
+    var partSize = document.getElementById('part_size');
+    var partUnit = document.getElementById('part_unit');
+    var folderBtn = document.getElementById('folder');
+    var clearBtn = document.getElementById('clear');
+    var maxFile = parseInt(pack.getAttribute('data-max-file'), 10) || 0;
+    var maxTotal = parseInt(pack.getAttribute('data-max-total'), 10) || 0;
+    var maxFiles = parseInt(pack.getAttribute('data-max-files'), 10) || 0;
+    var maxInput = parseInt(pack.getAttribute('data-max-input'), 10) || 0;
+    var items = [];   // { file, path }
+
+    var total = function () { return items.reduce(function (s, it) { return s + it.file.size; }, 0); };
+
+    var render = function () {
+      listBody.textContent = '';
+      items.forEach(function (it, i) {
+        var tr = document.createElement('tr');
+        var name = document.createElement('td'); name.className = 'path'; name.textContent = it.path;
+        var size = document.createElement('td'); size.className = 'size'; size.textContent = fmt(it.file.size);
+        var rm = document.createElement('td'); rm.className = 'rm';
+        var b = document.createElement('button');
+        b.type = 'button'; b.className = 'btn quiet small'; b.textContent = 'Usuń';
+        b.setAttribute('aria-label', 'Usuń ' + it.path);
+        b.addEventListener('click', function () { items.splice(i, 1); render(); });
+        rm.appendChild(b);
+        tr.appendChild(name); tr.appendChild(size); tr.appendChild(rm);
+        listBody.appendChild(tr);
+      });
+      list.hidden = items.length === 0;
+      clearBtn.hidden = items.length === 0;
+      sum.textContent = items.length
+        ? items.length + ' ' + plPlural(items.length, 'plik', 'pliki', 'plików') + ', razem ' + fmt(total()) + '.'
+        : 'Nie wybrano jeszcze żadnych plików.';
+    };
+
+    var add = function (file, path) {
+      path = path || file.webkitRelativePath || file.name;
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].path === path && items[i].file.size === file.size && items[i].file.lastModified === file.lastModified) { return; }
+      }
+      items.push({ file: file, path: path });
+    };
+
+    var validate = function () {
+      if (maxFiles && items.length > maxFiles) { return 'Za dużo plików naraz. Limit to ' + maxFiles + '.'; }
+      for (var i = 0; i < items.length; i++) {
+        if (maxFile && items[i].file.size > maxFile) {
+          return 'Plik „' + items[i].path + '” jest za duży. Limit jednego pliku to ' + fmt(maxFile) + '.';
+        }
+      }
+      var t = total();
+      // zapas na nagłówki multipart (ok. 300 B na plik)
+      if (maxTotal && t + items.length * 300 + 2048 > maxTotal) {
+        return 'Pliki są za duże. Limit przesyłania na tym serwerze to ' + fmt(maxTotal) + '.';
+      }
+      if (maxInput && t > maxInput) { return 'Pliki przekraczają limit ' + fmt(maxInput) + '.'; }
+      return null;
+    };
+
+    var addList = function (files) {
+      Array.prototype.forEach.call(files, function (f) { add(f); });
+      var msg = validate();
+      if (msg) { showError(msg); } else { clearError(); }
+      render();
+    };
+
+    picker.addEventListener('change', function () { addList(picker.files); picker.value = ''; });
+
+    // zapis folderu (webkitdirectory) i upuszczanie folderów
+    if ('webkitdirectory' in picker) {
+      var dirPicker = document.createElement('input');
+      dirPicker.type = 'file'; dirPicker.multiple = true; dirPicker.hidden = true;
+      dirPicker.setAttribute('webkitdirectory', '');
+      dirPicker.addEventListener('change', function () { addList(dirPicker.files); dirPicker.value = ''; });
+      pack.appendChild(dirPicker);
+      folderBtn.hidden = false;
+      folderBtn.addEventListener('click', function () { dirPicker.click(); });
+    }
+    clearBtn.addEventListener('click', function () { items = []; clearError(); render(); });
+
+    var walk = function (entry, prefix, done) {
+      if (entry.isFile) {
+        entry.file(function (f) { add(f, prefix + entry.name); done(); }, done);
+      } else if (entry.isDirectory) {
+        var reader = entry.createReader(), all = [];
+        (function more() {
+          reader.readEntries(function (batch) {
+            if (batch.length) { all = all.concat(Array.prototype.slice.call(batch)); more(); return; }
+            var left = all.length;
+            if (!left) { done(); return; }
+            all.forEach(function (en) {
+              walk(en, prefix + entry.name + '/', function () { if (--left === 0) { done(); } });
+            });
+          }, done);
+        })();
+      } else { done(); }
+    };
+
+    dragUi(function (e) {
+      var dt = e.dataTransfer;
+      if (!dt) { return; }
+      var entries = [];
+      if (dt.items && dt.items.length && dt.items[0].webkitGetAsEntry) {
+        for (var i = 0; i < dt.items.length; i++) {
+          var en = dt.items[i].webkitGetAsEntry();
+          if (en) { entries.push(en); }
+        }
+      }
+      if (!entries.length) { addList(dt.files); return; }
+      var left = entries.length;
+      entries.forEach(function (en) {
+        walk(en, '', function () {
+          if (--left === 0) {
+            var msg = validate();
+            if (msg) { showError(msg); } else { clearError(); }
+            render();
+          }
+        });
+      });
+    });
+
+    // reguły zależne od formatu
+    var updateFormat = function () {
+      var f = format.value;
+      var canPass = f === 'zip' || f === '7z';
+      password.disabled = !canPass;
+      if (!canPass) { password.value = ''; }
+      partSize.disabled = partUnit.disabled = f !== '7z';
+      if (f !== '7z') { partSize.value = ''; }
+      note.textContent = f === 'gz' || f === 'bz2'
+        ? 'Format ' + f.toUpperCase() + ' pakuje jeden plik. Przy wielu plikach powstanie TAR.' + f.toUpperCase() + '.'
+        : (canPass ? '' : 'Ten format nie obsługuje haseł.');
+    };
+    format.addEventListener('change', updateFormat);
+    updateFormat();
+    render();
+
+    pack.addEventListener('submit', function (e) {
+      if (!window.FormData || !window.XMLHttpRequest) { return; }   // bez JS działa zwykły formularz
+      e.preventDefault();
+      if (!items.length) { showError('Dodaj przynajmniej jeden plik.'); return; }
+      var msg = validate();
+      if (msg) { showError(msg); return; }
+      var data = new FormData(pack);
+      data.delete('files[]');
+      items.forEach(function (it) {
+        data.append('files[]', it.file, it.file.name);
+        data.append('paths[]', it.path);
+      });
+      send(pack, data, 'Pakowanie…', 'Nie udało się spakować plików.');
+    });
+  }
 
   var filter = document.getElementById('filter');
   if (filter) {
@@ -1305,6 +2107,10 @@ details ul{margin:.5rem 0 0;padding-left:1.2rem;overflow-wrap:anywhere}
 /* ------------------------------------------------------------------ */
 /*  Start                                                              */
 /* ------------------------------------------------------------------ */
+
+if (defined('UNPACK_NO_BOOT')) { // testy ładują same funkcje, bez obsługi żądania
+    return;
+}
 
 ini_set('session.use_strict_mode', '1');
 session_set_cookie_params(['httponly' => true, 'samesite' => 'Lax', 'secure' => !empty($_SERVER['HTTPS'])]);
@@ -1331,7 +2137,7 @@ if (isset($_GET['j'])) {
     $token = (string)$_GET['j'];
     $job = loadJob($token);
     if ($job === null) {
-        $error = 'Ten wynik już nie istnieje — wygasł albo został usunięty. Rozpakuj archiwum jeszcze raz.';
+        $error = 'Ten wynik już nie istnieje — wygasł albo został usunięty. Zacznij jeszcze raz.';
     }
 }
 renderPage($error, $job, $token);
